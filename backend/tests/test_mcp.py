@@ -274,16 +274,18 @@ def _jsonrpc(method: str, params: dict, id_: int = 0) -> dict:
 
 @asynccontextmanager
 async def _mcp_http_client():
-    """创建 MCP HTTP 测试客户端（LifespanManager + ASGITransport）。
+    """创建 MCP HTTP 测试客户端（手动触发 lifespan + ASGITransport）。
 
     关键：ASGITransport 不触发 ASGI lifespan，但 MCP StreamableHTTPASGIApp
-    需要 lifespan 初始化 task_group。用 asgi-lifespan 的 LifespanManager
-    手动触发 _mcp_app 的 lifespan。
+    需要 lifespan 初始化 task_group。直接用 _mcp_app.router.lifespan_context()
+    手动触发 _mcp_app 的 lifespan（和 main.py 里的方式一致），不需要额外依赖。
+
+    路径注意：FastAPI mount("/mcp", subapp) 必须 POST 到 /mcp/（带尾斜杠）
+    才会转发给子应用的根路径 /。POST /mcp（无尾斜杠）返回 405。
     """
-    from asgi_lifespan import LifespanManager
     from backend.main import create_app, _mcp_app
 
-    async with LifespanManager(_mcp_app):
+    async with _mcp_app.router.lifespan_context(_mcp_app):
         app = create_app()
         transport = ASGITransport(app=app)
         async with httpx.AsyncClient(
@@ -297,18 +299,20 @@ class TestMCPFastAPIIntegration:
 
     用 httpx ASGITransport 直接测 FastAPI app，不发真实网络请求。
     MCP 用 stateless_http=True，每个请求独立处理，无需 session 管理。
-    follow_redirects=True 处理 FastAPI mount 的 /mcp → /mcp/ 307 重定向。
 
-    关键坑：ASGITransport 不触发 ASGI lifespan，MCP StreamableHTTPASGIApp
-    需要 lifespan 初始化 session_manager / task_group。解法：用 asgi-lifespan
-    的 LifespanManager 手动触发 _mcp_app 的 lifespan。
+    坑1：ASGITransport 不触发 ASGI lifespan，MCP StreamableHTTPASGIApp
+         需要 lifespan 初始化 session_manager / task_group。
+         解法：直接用 _mcp_app.router.lifespan_context() 手动触发。
+    坑2：FastAPI mount("/mcp", subapp) 必须 POST 到 /mcp/（带尾斜杠）
+         才会转发给子应用的根路径 /。POST /mcp（无尾斜杠）返回 405，
+         follow_redirects 没用——因为返回的是 405 不是 307。
     """
 
     @pytest.mark.asyncio
     async def test_mcp_endpoint_exists(self):
-        """POST /mcp 不返回 404（端点已挂载到 FastAPI）。"""
+        """POST /mcp/ 不返回 404（端点已挂载到 FastAPI）。"""
         async with _mcp_http_client() as client:
-            resp = await client.post("/mcp", json=_jsonrpc("initialize", {
+            resp = await client.post("/mcp/", json=_jsonrpc("initialize", {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "test", "version": "1.0"},
@@ -320,14 +324,14 @@ class TestMCPFastAPIIntegration:
         """通过 HTTP JSON-RPC 调 ping tool → 返回 result。"""
         async with _mcp_http_client() as client:
             # Initialize（stateless 模式下仍需握手，但无 session）
-            await client.post("/mcp", json=_jsonrpc("initialize", {
+            await client.post("/mcp/", json=_jsonrpc("initialize", {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "test", "version": "1.0"},
             }), headers=_MCP_HEADERS)
 
             # 调 ping tool
-            call_resp = await client.post("/mcp", json=_jsonrpc("tools/call", {
+            call_resp = await client.post("/mcp/", json=_jsonrpc("tools/call", {
                 "name": "ping",
                 "arguments": {},
             }, id_=1), headers=_MCP_HEADERS)
@@ -341,13 +345,13 @@ class TestMCPFastAPIIntegration:
         _patch_llm(monkeypatch)
 
         async with _mcp_http_client() as client:
-            await client.post("/mcp", json=_jsonrpc("initialize", {
+            await client.post("/mcp/", json=_jsonrpc("initialize", {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "test", "version": "1.0"},
             }), headers=_MCP_HEADERS)
 
-            call_resp = await client.post("/mcp", json=_jsonrpc("tools/call", {
+            call_resp = await client.post("/mcp/", json=_jsonrpc("tools/call", {
                 "name": "review_code",
                 "arguments": {"code": "api_key = 'sk-xxx'", "language": "python"},
             }, id_=1), headers=_MCP_HEADERS)

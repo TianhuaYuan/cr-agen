@@ -6,12 +6,11 @@
 - 空代码 → 直接返回空 tasks + error 标记，不调 LLM。
 - LLM 调用失败 / 返回非 JSON / JSON 结构不对 → 降级为默认 4 角色任务。
 """
-import json
 import logging
-import re
 
 from backend.core.config import settings
 from backend.core import llm as llm_mod
+from backend.core.common import extract_json_array
 from backend.schemas.task import TaskSchema
 
 logger = logging.getLogger(__name__)
@@ -51,18 +50,6 @@ def _default_tasks() -> list[dict]:
     return [t.model_dump() for t in _DEFAULT_TASKS]
 
 
-def _extract_json_array(text: str) -> list:
-    """从 LLM 文本里抠出 JSON 数组。
-
-    LLM 常把 JSON 包在 ```json ... ``` 或夹杂解释文字里，不能 json.loads 整个文本。
-    用正则抓第一个 '[' 到最后一个 ']' 的子串，最稳。抓不到就抛错走降级。
-    """
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if not match:
-        raise ValueError("响应中找不到 JSON 数组")
-    return json.loads(match.group(0))
-
-
 async def decompose_node(state: dict) -> dict:
     """把一次 Review 拆成若干子任务，返回 {"tasks": [...], "iteration_count": N}。
 
@@ -91,7 +78,7 @@ async def decompose_node(state: dict) -> dict:
             temperature=0.2,
         )
         text = resp.choices[0].message.content or ""
-        raw = _extract_json_array(text)
+        raw = extract_json_array(text)
         if not isinstance(raw, list):
             raise ValueError("LLM 返回的不是数组")
         tasks = [TaskSchema(**item).model_dump() for item in raw]

@@ -16,7 +16,8 @@ from sqlalchemy.pool import StaticPool
 from backend.core.database import Base, get_db
 
 
-EVAL_DATASET = "backend/tests/eval_samples/dataset.json"
+from pathlib import Path
+EVAL_DATASET = str(Path(__file__).resolve().parent / "eval_samples" / "dataset.json")
 
 
 @pytest_asyncio.fixture
@@ -122,3 +123,52 @@ class TestEvaluationSummaryAPI:
         assert data2["total"] == data1["total"]
         assert "from_cache" in data2
         assert data2["from_cache"] is False
+
+
+class TestScanThresholdAPI:
+    """GET /api/v1/evaluation/scan-threshold（Task 13.4）。"""
+
+    async def test_scan_threshold_200_and_structure(self, eval_api_client):
+        """返回 200，包含 table / current_threshold / best_f1_threshold。"""
+        res = await eval_api_client.get("/api/v1/evaluation/scan-threshold")
+        assert res.status_code == 200
+        data = res.json()
+        assert "table" in data
+        assert "current_threshold" in data
+        assert "best_f1_threshold" in data
+
+    async def test_scan_threshold_table_10_rows(self, eval_api_client):
+        """table 含 10 行（0.0~0.9 步长 0.1）。"""
+        res = await eval_api_client.get("/api/v1/evaluation/scan-threshold")
+        data = res.json()
+        assert len(data["table"]) == 10
+        # 阈值递增 0.0 → 0.9
+        thresholds = [row["threshold"] for row in data["table"]]
+        assert thresholds == [round(i / 10, 1) for i in range(10)]
+
+    async def test_scan_threshold_row_fields(self, eval_api_client):
+        """每行含 threshold / precision / recall / f1。"""
+        res = await eval_api_client.get("/api/v1/evaluation/scan-threshold")
+        data = res.json()
+        for row in data["table"]:
+            assert "threshold" in row
+            assert "precision" in row
+            assert "recall" in row
+            assert "f1" in row
+            assert 0.0 <= row["precision"] <= 1.0
+            assert 0.0 <= row["recall"] <= 1.0
+            assert 0.0 <= row["f1"] <= 1.0
+
+    async def test_scan_threshold_best_f1_in_range(self, eval_api_client):
+        """best_f1_threshold 在 0.0~0.9 之间。"""
+        res = await eval_api_client.get("/api/v1/evaluation/scan-threshold")
+        data = res.json()
+        assert 0.0 <= data["best_f1_threshold"] <= 0.9
+
+    async def test_scan_threshold_current_threshold_from_settings(self, eval_api_client):
+        """current_threshold 来自 settings.DEFAULT_CONFIDENCE_THRESHOLD。"""
+        res = await eval_api_client.get("/api/v1/evaluation/scan-threshold")
+        data = res.json()
+        # 默认 0.0
+        assert data["current_threshold"] == 0.0
+

@@ -12,14 +12,24 @@ import pytest_asyncio
 
 
 def _install_fake_fastmcp():
-    """把 fastmcp 伪造成假模块，绕过环境缺失。
+    """如果环境里没有完整的 fastmcp（仅安装了 slim 版本），就伪造假模块绕过 import。
 
-    沙箱环境装不了 fastmcp，但 backend/main.py 是模块级 import（from backend.mcp.server import mcp），
-    只要 import main.py 就会触发 fastmcp import 失败。这里在 sys.modules 里提前注册一个假的
-    fastmcp 模块，提供 FastMCP 类的最小实现（构造 + http_app + tool 装饰器）。
+    为什么有这个：沙箱/CI 环境可能只装了 fastmcp-slim（缺少 server 支持），
+    但 backend/main.py 是模块级 import（from backend.mcp.server import mcp），
+    只要 import main.py 就会触发 fastmcp.server import 失败。
+    这里在 sys.modules 里注册假的 fastmcp 模块，提供 FastMCP 的最小实现。
+
+    策略：先卸载已存在的 fastmcp（可能是 slim 版本，缺少 server），再安装假的。
     """
-    if "fastmcp" in sys.modules:
-        return
+    for key in list(sys.modules.keys()):
+        if key.startswith("fastmcp"):
+            del sys.modules[key]
+
+    try:
+        from fastmcp import FastMCP  # noqa: F401
+        return  # 真实 fastmcp 完整可用
+    except ImportError:
+        pass  # 没有完整的，继续装假的
 
     from types import SimpleNamespace as _SN
 

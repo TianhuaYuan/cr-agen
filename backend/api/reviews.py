@@ -3,6 +3,8 @@
 POST /api/v1/reviews         → 创建审查任务 + 同步执行 graph → 返回结果
 POST /api/v1/reviews/stream  → SSE 流式：节点事件 + 最终 complete
 GET  /api/v1/reviews/{id}    → 查询审查状态和报告
+POST /api/v1/reviews/from-pr → 从 GitHub PR URL 创建审查任务
+POST /api/v1/reviews/stream/from-pr → SSE 流式审查 PR
 
 W1 简化：POST 同步执行 graph（无后台任务队列），返回时 status=completed。
 W2 加 Celery/BackgroundTasks 后改为 202 + 后台异步执行。
@@ -16,9 +18,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import require_auth
+from backend.core.common import fetch_pr_code
 from backend.core.database import get_db
+from backend.integrations.github import GitHubClient
 from backend.models.review import Review
-from backend.schemas.review import ReviewRequest, ReviewResponse
+from backend.schemas.review import PRReviewRequest, ReviewRequest, ReviewResponse
 from backend.services.supervisor.graph import build_supervisor_graph
 
 logger = logging.getLogger(__name__)
@@ -175,3 +179,57 @@ async def get_review(review_id: str, db: AsyncSession = Depends(get_db)):
     if not review:
         raise HTTPException(status_code=404, detail="审查任务不存在")
     return ReviewResponse.from_orm_model(review, str(review.id))
+
+
+async def _fetch_pr_code(pr_url: str) -> tuple[str, str]:
+    """从 PR URL 拉取代码并检测语言 → (code, language)。
+
+    失败抛 HTTPException。
+    """
+    try:
+        return await fetch_pr_code(pr_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("拉取 PR patch 失败: %s", exc, exc_info=True)
+        raise HTTPException(status_code=502, detail=f"拉取 PR 失败: {exc}")
+
+
+@router.post("/from-pr", response_model=ReviewResponse, status_code=200)
+async def create_review_from_pr(req: PRReviewRequest, db: AsyncSession = Depends(get_db)):
+    """从 GitHub PR URL 创建代码审查（同步）。"""
+    code, language = await _fetch_pr_code(req.pr_url)
+
+    review = await _create_review_record(code, language, db)
+
+    try:
+        graph = build_supervisor_graph()
+        result = await graph.ainvoke({
+            "code": code,
+            "language": language,
+        })
+        review.status = "completed"
+        review.report = result.get("report", "")
+    except Exception as exc:
+        logger.error("审查执行失败: %s", exc, exc_info=True)
+        review.status = "failed"
+        review.report = f"# 审查失败\n\n执行过程中发生异常：{exc}"
+
+    await db.commit()
+    await db.refresh(review)
+    return ReviewResponse.from_orm_model(review, str(review.id))
+
+
+@router.post("/stream/from-pr")
+async def stream_review_from_pr(req: PRReviewRequest, db: AsyncSession = Depends(get_db)):
+    """从 GitHub PR URL 创建代码审查（SSE 流式）。"""
+    code, language = await _fetch_pr_code(req.pr_url)
+
+    return StreamingResponse(
+        _run_review_stream(code, language, db),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )

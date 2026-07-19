@@ -38,9 +38,15 @@ _SEVERITY_COUNT_KEYS = {"high": "high", "medium": "medium", "low": "low", "info"
 
 
 def generate_report(findings: list[dict], language: str = "python",
-                    errors: list[str] | None = None) -> str:
-    """渲染 Markdown 审查报告。"""
+                    errors: list[str] | None = None,
+                    low_confidence: list[dict] | None = None) -> str:
+    """渲染 Markdown 审查报告。
+
+    Task 13.2 新增 low_confidence 参数：低置信度 finding 单独展示在报告末尾的
+    「低置信度提示」区，与正式发现区分开，避免噪音干扰但又保留信息。
+    """
     errors = errors or []
+    low_confidence = low_confidence or []
     lines: list[str] = []
 
     # ── 标题 ──
@@ -58,6 +64,8 @@ def generate_report(findings: list[dict], language: str = "python",
     lines.append(f"- **语言**: {language}")
     lines.append(f"- **问题总数**: {total}（高危: {counts['high']}, "
                  f"中危: {counts['medium']}, 低危: {counts['low']}, 提示: {counts['info']}）")
+    if low_confidence:
+        lines.append(f"- **低置信度提示**: {len(low_confidence)} 条（已折叠，详见报告末尾）")
     workers_present = sorted(set(f.get("worker", "?") for f in findings))
     if workers_present:
         lines.append(f"- **审查维度**: {', '.join(workers_present)}")
@@ -87,6 +95,22 @@ def generate_report(findings: list[dict], language: str = "python",
     else:
         lines.append("## ✅ 未发现问题\n")
         lines.append("本次审查未发现明显问题。\n")
+
+    # ── 低置信度提示区（Task 13.2）──
+    if low_confidence:
+        lines.append("## 💭 低置信度提示\n")
+        lines.append(f"> 以下 {len(low_confidence)} 条发现置信度较低，可能为误报，仅供参考。\n")
+        lines.append("| 行号 | 严重度 | 问题 | 建议 | 来源 | 置信度 |")
+        lines.append("|------|--------|------|------|------|--------|")
+        for f in low_confidence:
+            line = f.get("line", "—")
+            sev = _SEVERITY_BADGE.get(f.get("severity", "info"), f.get("severity", ""))
+            desc = f.get("description", "")
+            sug = f.get("suggestion", "")
+            sources = ", ".join(f.get("sources", [f.get("worker", "?")]))
+            conf = f.get("confidence", "?")
+            lines.append(f"| {line} | {sev} | {desc} | {sug} | {sources} | {conf} |")
+        lines.append("")
 
     # ── 异常区 ──
     if errors:

@@ -118,6 +118,7 @@ async def judge_with_llm(
     resp = await client.chat.completions.create(
         model=settings.CHAT_MODEL,
         messages=[{"role": "user", "content": prompt}],
+        timeout=settings.LLM_TIMEOUT,
     )
     text = resp.choices[0].message.content
     data = _parse_judge_json(text)

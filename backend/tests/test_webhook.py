@@ -81,13 +81,17 @@ _PAYLOAD = {
 }
 
 
-def _make_app_with_mock_gh(monkeypatch):
+def _make_app_with_mock_gh(monkeypatch, webhook_secret=""):
     """构造 app，并把 GitHubClient 构造器替换为注入 fake http 的实例。"""
     _patch_llm(monkeypatch)
     import backend.integrations.github as gh_mod
 
     fake_gh = GitHubClient(http_client=_FakeHTTPClient(_SAMPLE_PATCH))
     monkeypatch.setattr(gh_mod, "GitHubClient", lambda *a, **k: fake_gh)
+
+    if webhook_secret:
+        from backend.core.config import settings
+        monkeypatch.setattr(settings, "GITHUB_WEBHOOK_SECRET", webhook_secret)
 
     from backend.main import create_app
 
@@ -98,8 +102,8 @@ def _make_app_with_mock_gh(monkeypatch):
 async def test_webhook_reviews_pr(monkeypatch):
     """pull_request opened + 合法签名 → 拉 diff → 审查 → 返回报告。"""
     secret = "test-secret"
-    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", secret)
-    app = _make_app_with_mock_gh(monkeypatch)
+    monkeypatch.setenv("CR_AGENT_GITHUB_WEBHOOK_SECRET", secret)
+    app = _make_app_with_mock_gh(monkeypatch, webhook_secret=secret)
 
     transport = ASGITransport(app=app)
     body = json.dumps(_PAYLOAD).encode()
@@ -121,8 +125,8 @@ async def test_webhook_reviews_pr(monkeypatch):
 @pytest.mark.asyncio
 async def test_webhook_invalid_signature(monkeypatch):
     """非法签名 → 401。"""
-    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "test-secret")
-    app = _make_app_with_mock_gh(monkeypatch)
+    monkeypatch.setenv("CR_AGENT_GITHUB_WEBHOOK_SECRET", "test-secret")
+    app = _make_app_with_mock_gh(monkeypatch, webhook_secret="test-secret")
 
     transport = ASGITransport(app=app)
     body = json.dumps(_PAYLOAD).encode()
@@ -142,8 +146,8 @@ async def test_webhook_invalid_signature(monkeypatch):
 async def test_webhook_ignores_non_pr_event(monkeypatch):
     """非 pull_request 事件 → 忽略（status=ignored）。"""
     secret = "test-secret"
-    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", secret)
-    app = _make_app_with_mock_gh(monkeypatch)
+    monkeypatch.setenv("CR_AGENT_GITHUB_WEBHOOK_SECRET", secret)
+    app = _make_app_with_mock_gh(monkeypatch, webhook_secret=secret)
 
     transport = ASGITransport(app=app)
     body = json.dumps(_PAYLOAD).encode()
@@ -179,7 +183,7 @@ async def test_webhook_rejects_oversized_body(monkeypatch):
 
     修复前：handler 先 `await request.body()` 无上限缓冲，再验签 → 攻击者可耗尽内存/CPU。
     """
-    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setenv("CR_AGENT_GITHUB_WEBHOOK_SECRET", "test-secret")
     app = _make_app_with_mock_gh(monkeypatch)
 
     transport = ASGITransport(app=app)
@@ -206,7 +210,7 @@ async def test_webhook_rejects_when_secret_required_but_missing(monkeypatch):
     from backend.core.config import settings
 
     monkeypatch.setattr(settings, "WEBHOOK_SECRET_REQUIRED", True)
-    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "")  # 确保 secret 为空
+    monkeypatch.setenv("CR_AGENT_GITHUB_WEBHOOK_SECRET", "")  # 确保 secret 为空
     app = _make_app_with_mock_gh(monkeypatch)
 
     transport = ASGITransport(app=app)

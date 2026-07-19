@@ -19,6 +19,7 @@ import os
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
+from backend.core.common import fetch_pr_code
 from backend.core.config import settings
 from backend.integrations import github as github_pkg
 from backend.services.supervisor.graph import build_supervisor_graph
@@ -77,7 +78,7 @@ async def github_webhook(
     x_github_event: str | None = Header(default=None),
 ):
     body = await _read_body_limited(request)
-    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+    secret = settings.GITHUB_WEBHOOK_SECRET
     if not _verify_signature(secret, body, x_hub_signature_256):
         raise HTTPException(status_code=401, detail="invalid signature")
 
@@ -95,11 +96,7 @@ async def github_webhook(
     if not pr_url:
         raise HTTPException(status_code=400, detail="missing pull_request.html_url")
 
-    gh = github_pkg.GitHubClient(token=os.getenv("GITHUB_TOKEN"))
-    owner, repo, number = gh.parse_pr_url(pr_url)
-    patch = await gh.get_pr_patch(owner, repo, number)
-    code = gh.parse_patch_to_code(patch)
-    lang = gh.detect_language(patch)
+    code, lang = await fetch_pr_code(pr_url)
 
     graph = build_supervisor_graph()
     result = await graph.ainvoke({"code": code, "language": lang})

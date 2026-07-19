@@ -179,7 +179,9 @@ async def test_run_all_returns_tokens_with_meter(monkeypatch):
     from backend.services.evaluation.cost import TokenMeter
 
     meter = TokenMeter()
-    summary = await run_all("backend/tests/eval_samples/dataset.json", limit=1, meter=meter)
+    from pathlib import Path
+    dataset_path = Path(__file__).resolve().parent / "eval_samples" / "dataset.json"
+    summary = await run_all(dataset_path, limit=1, meter=meter)
     assert summary["tokens"] is not None
     assert summary["tokens"]["call_count"] >= 5  # decompose + 4 Worker
     assert summary["tokens"]["total_tokens"] > 0

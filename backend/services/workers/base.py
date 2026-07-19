@@ -11,19 +11,23 @@
   patch 源模块不影响已导入的引用。
 
 容错（Partial Failure 不阻塞）：
-- LLM 调异常 → 捕获 → 返回 1 条 info 级 error finding（不抛）。
+- LLM transient 错误 → 重试 1 次（退避 1s，覆盖网络瞬断 / 5xx / 429）。
+- LLM 超时 / 重试耗尽 → 返回 1 条 info 级 error finding（不抛）。
 - LLM 返回非 JSON → _parse_response 降级为 info finding。
 """
 import asyncio
 import json
 import logging
-import re
+import time
 from abc import ABC
 
 from openai import APITimeoutError
 
 from backend.core import llm as llm_mod
+from backend.core import tracing as tracing_mod
+from backend.core.common import extract_json_array
 from backend.core.config import settings
+from backend.core.retry import with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +40,30 @@ _OUTPUT_FORMAT = (
     '"line": 行号或null, '
     '"description": "问题描述", '
     '"suggestion": "修复建议", '
-    '"code_snippet": "相关代码片段"}\n'
+    '"code_snippet": "相关代码片段", '
+    '"confidence": 0.0到1.0的浮点数表示你对这条发现的置信度}\n'
     "只输出 JSON，不要解释文字。"
 )
+
+# confidence 兜底默认值：LLM 没给 confidence 时用这个（中等置信度，不偏不倚）。
+_DEFAULT_CONFIDENCE = 0.5
+
+
+def _clamp_confidence(value) -> float:
+    """把 confidence 规范化到 [0.0, 1.0] 的 float。
+
+    - 非数值（字符串/None）→ 兜底 _DEFAULT_CONFIDENCE
+    - 数值越界 → clamp 到 [0.0, 1.0]
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return _DEFAULT_CONFIDENCE
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
 
 
 class BaseWorker(ABC):
@@ -68,11 +93,12 @@ class BaseWorker(ABC):
     async def review(self, code: str, language: str) -> list[dict]:
         """build → call → parse 主流程。子类不重写此方法。
 
-        容错三层（Phase 5）：
-        1. LLM 超时（asyncio.wait_for）→ 降级 info finding
-        2. LLM 异常 → 降级 info finding
-        3. LLM 返回非 JSON → _parse_response 降级 info finding
-        三种情况都不抛异常，保证 graph 不被单个 Worker 阻塞。
+        容错（Phase 5 + retry）：
+        1. LLM transient 错误 → with_retry 重试 1 次（退避 1s）
+        2. LLM 超时（asyncio.wait_for）→ 降级 info finding
+        3. 重试耗尽 / 异常 → 降级 info finding
+        4. LLM 返回非 JSON → _parse_response 降级 info finding
+        以上都不抛异常，保证 graph 不被单个 Worker 阻塞。
         """
         try:
             prompt = self._build_prompt(code, language)
@@ -89,6 +115,7 @@ class BaseWorker(ABC):
                 "suggestion": "请检查 LLM 响应延迟或重试",
                 "code_snippet": "",
                 "worker": self.role,
+                "confidence": 0.0,
             }]
         except Exception as exc:
             logger.warning("Worker[%s] review 异常: %s", self.role, exc)
@@ -99,6 +126,7 @@ class BaseWorker(ABC):
                 "suggestion": "请检查 LLM 配置或重试",
                 "code_snippet": "",
                 "worker": self.role,
+                "confidence": 0.0,
             }]
 
     # ── 可覆写的钩子 ──────────────────────────────────────
@@ -116,29 +144,56 @@ class BaseWorker(ABC):
 
     async def _call_llm(self, prompt: str) -> str:
         client = llm_mod.get_chat_client()
-        resp = await client.chat.completions.create(
-            model=settings.CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=4096,
-            # 让 worker 的 timeout 成为权威超时，覆盖客户端默认（同读 config.LLM_TIMEOUT），
-            # 否则客户端会先抛 APITimeoutError，使上方 asyncio.TimeoutError 分支成死代码。
-            timeout=self.timeout,
-        )
-        return resp.choices[0].message.content or ""
+        # 重试 1 次：网络瞬断 / 5xx / 429 等 transient 错误，退避 1s 后重试。
+        # 超时（APITimeoutError）不重试——总时间预算由外层 asyncio.wait_for 控制（self.timeout），
+        # 若第一次调用已耗到 ~119s，重试只会多消耗用户 1s 且大概率仍超时，得不偿失。
+        # 编程错误（TypeError/ValueError 等）不重试，立即抛。
+        # Task 14.2: tracing 包裹 LLM 调用，记录 prompt/completion/latency/tokens。
+        # NoOp tracer 零开销（仅 with + 字典赋值）；Langfuse 模式同步到 backend。
+        tracer = tracing_mod.get_tracer()
+        with tracer.start_span(
+            "llm_call",
+            metadata={
+                "role": self.role,
+                "model": settings.CHAT_MODEL,
+                "prompt_length": len(prompt),
+            },
+        ) as span:
+            start = time.perf_counter()
+            resp = await with_retry(
+                client.chat.completions.create,
+                model=settings.CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=4096,
+                timeout=self.timeout,
+                max_retries=1,
+                base_delay=1.0,
+            )
+            text = resp.choices[0].message.content or ""
+            latency_ms = (time.perf_counter() - start) * 1000.0
+            update_meta: dict = {
+                "completion_length": len(text),
+                "latency_ms": round(latency_ms, 2),
+            }
+            usage = getattr(resp, "usage", None)
+            if usage is not None and getattr(usage, "total_tokens", None) is not None:
+                update_meta["tokens"] = usage.total_tokens
+            span.update(update_meta)
+            return text
 
     def _parse_response(self, text: str) -> list[dict]:
-        """解析 LLM 返回的 JSON 数组。失败 → 1 条 info 降级 finding。"""
+        """解析 LLM 返回的 JSON 数组。失败 → 1 条 info 降级 finding。
+
+        confidence 处理（Task 13.1）：
+        - 正常 finding：缺失 → 兜底 0.5；越界 → clamp 到 [0,1]；非数值 → 0.5
+        - 降级 finding（解析失败/超时/异常）：confidence = 0.0（最不可信）
+        """
         try:
-            match = re.search(r"\[.*\]", text, re.DOTALL)
-            if not match:
-                raise ValueError("响应中找不到 JSON 数组")
-            findings = json.loads(match.group(0))
-            if not isinstance(findings, list):
-                raise ValueError("LLM 返回的不是数组")
+            findings = extract_json_array(text)
         except (json.JSONDecodeError, ValueError) as exc:
             logger.warning("Worker[%s] JSON 解析失败: %s", self.role, exc)
             return [{
@@ -148,13 +203,16 @@ class BaseWorker(ABC):
                 "suggestion": "LLM 输出格式异常，请重试",
                 "code_snippet": "",
                 "worker": self.role,
+                "confidence": 0.0,
             }]
 
-        # 补 worker 字段 + 清洗
+        # 补 worker 字段 + confidence 清洗
         for f in findings:
             if isinstance(f, dict):
                 f.setdefault("worker", self.role)
                 f.setdefault("line", None)
                 f.setdefault("suggestion", "")
                 f.setdefault("code_snippet", "")
+                # confidence：缺失 → 0.5；越界 → clamp；非数值 → 0.5
+                f["confidence"] = _clamp_confidence(f.get("confidence", _DEFAULT_CONFIDENCE))
         return findings

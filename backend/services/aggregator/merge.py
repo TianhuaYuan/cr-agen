@@ -60,10 +60,49 @@ def _merge_two(a: dict, b: dict) -> dict:
     }
 
 
-def aggregate_findings(findings: list[dict]) -> list[dict]:
-    """去重 + 排序。返回新的列表，不修改输入。"""
+def split_by_confidence(findings: list[dict], threshold: float = 0.0) -> tuple[list[dict], list[dict]]:
+    """按 confidence 阈值把 findings 拆成 (high, low) 两个列表。
+
+    - confidence >= threshold → high（高置信度，正式报告）
+    - confidence < threshold → low（低置信度，提示区）
+    - 缺失 confidence 字段 → 视为 0.0（最不可信）
+
+    不修改输入列表，返回新的列表。
+    """
+    if threshold <= 0.0:
+        return list(findings), []
+    high: list[dict] = []
+    low: list[dict] = []
+    for f in findings:
+        conf = f.get("confidence", 0.0)
+        # 非数值 confidence 兜底为 0.0
+        try:
+            conf = float(conf)
+        except (TypeError, ValueError):
+            conf = 0.0
+        if conf >= threshold:
+            high.append(f)
+        else:
+            low.append(f)
+    return high, low
+
+
+def aggregate_findings(findings: list[dict],
+                       confidence_threshold: float = 0.0) -> list[dict]:
+    """去重 + 排序。返回新的列表，不修改输入。
+
+    confidence_threshold > 0 时，先过滤掉 confidence < threshold 的 finding
+    （缺失 confidence 视为 0.0），再对剩余做去重 + 排序。
+    低置信度的 finding 不会出现在返回值里（如需获取，用 split_by_confidence）。
+    """
     if not findings:
         return []
+
+    # Task 13.2: 置信度阈值过滤
+    if confidence_threshold > 0.0:
+        findings, _low = split_by_confidence(findings, confidence_threshold)
+        if not findings:
+            return []
 
     # 去重：(line, description_lower) 为 key
     deduped: dict[tuple, dict] = {}

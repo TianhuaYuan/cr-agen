@@ -700,6 +700,47 @@ body {
   border-color: var(--input-border-focus);
 }
 
+.input-mode-toggle {
+  display: inline-flex;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+}
+.mode-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  padding: var(--space-1) var(--space-3);
+  border-radius: calc(var(--radius-sm) - 2px);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: var(--font-sans);
+}
+.mode-btn:hover {
+  color: var(--text);
+}
+.mode-btn.mode-active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.pr-url-input {
+  flex: 1;
+  background: var(--input-bg);
+  border: none;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: var(--space-4);
+  resize: none;
+  outline: none;
+  line-height: 1.6;
+  height: 48px;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
@@ -968,7 +1009,10 @@ body {
   .header-meta { display: none; }
 }
 @media (max-width: 480px) {
-  .main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+  .main { grid-template-columns: 1fr; grid-template-rows: auto 1fr; overflow: auto; }
+  .main.sidebar-collapsed { grid-template-columns: 1fr; }
+  .sidebar { display: none; }
+  .panel { min-width: 0; overflow: auto; }
   .panel-header { flex-wrap: wrap; gap: var(--space-1); padding: var(--space-2) var(--space-3); }
   .panel-tabs .tab { padding: var(--space-1) var(--space-2); font-size: 12px; }
   .panel-body { padding: var(--space-2) var(--space-3); }
@@ -982,6 +1026,9 @@ body {
   .header { padding: var(--space-2) var(--space-3); }
   .header-title { font-size: 14px; }
   .controls .btn { padding: var(--space-1) var(--space-2); font-size: 12px; }
+  .controls select { max-width: 100px; }
+  textarea { min-height: 120px; }
+  .mode-btns { flex-wrap: wrap; }
 }
 </style>
 </head>
@@ -1083,6 +1130,10 @@ body {
     <section class="panel">
       <div class="panel-header">
         <div class="panel-title">Code Input</div>
+        <div class="input-mode-toggle" role="tablist" aria-label="输入模式">
+          <button class="mode-btn mode-active" data-mode="code" role="tab" aria-selected="true">代码</button>
+          <button class="mode-btn" data-mode="pr" role="tab" aria-selected="false">PR URL</button>
+        </div>
         <div class="controls">
           <button class="btn btn-ghost" id="btn-sample" title="载入示例代码">Sample</button>
           <button class="btn btn-ghost" id="btn-clear" title="清空">Clear</button>
@@ -1108,6 +1159,14 @@ body {
 // 或点 Sample 载入示例
 // Ctrl/Cmd + Enter 快捷提交"
         ></textarea>
+        <input
+          type="url"
+          class="pr-url-input"
+          id="pr-url"
+          placeholder="https://github.com/owner/repo/pull/123"
+          aria-label="GitHub PR URL 输入框"
+          hidden
+        />
       </div>
       <div class="status-bar">
         <span id="status" class="status-idle" role="status" aria-live="polite">idle</span>
@@ -1124,6 +1183,10 @@ body {
         </div>
         <div class="controls">
           <button class="btn btn-ghost" id="btn-copy-md" title="复制原始 Markdown" disabled>Copy MD</button>
+          <select id="eval-mode-select" title="评测模式" hidden style="font-size:12px;padding:2px 6px;border-radius:6px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border);">
+            <option value="rule_based">规则基线</option>
+            <option value="llm">LLM Judge</option>
+          </select>
           <button class="btn btn-ghost" id="btn-eval-refresh" title="重新评测" hidden>重新评测</button>
         </div>
       </div>
@@ -1153,6 +1216,8 @@ const els = {
   sidebar:   $("sidebar"),
   code:      $("code"),
   lang:      $("lang"),
+  prUrl:     $("pr-url"),
+  modeBtns:  document.querySelectorAll(".mode-btn"),
   btnReview: $("btn-review"),
   btnSample: $("btn-sample"),
   btnClear:  $("btn-clear"),
@@ -1174,11 +1239,14 @@ const els = {
   tabEval:       $("tab-eval"),
   evalView:      $("eval-view"),
   btnEvalRefresh: $("btn-eval-refresh"),
+  evalModeSelect: $("eval-mode-select"),
 };
 
 let isRunning = false;
 let lastReportMd = "";
 let activeHistoryId = null;
+let inputMode = "code"; // "code" | "pr"
+let evalMode = "rule_based"; // "rule_based" | "llm"
 
 /* ════════════════════════════════════════════════════════════
    LocalStorage 持久化(历史 + 主题)
@@ -1340,8 +1408,48 @@ function setStatus(state, text) {
 }
 
 function updateMeta() {
-  const len = els.code.value.length;
-  els.meta.textContent = `${len} chars · ${els.lang.value}`;
+  if (inputMode === "pr") {
+    els.meta.textContent = "GitHub PR";
+  } else {
+    const len = els.code.value.length;
+    els.meta.textContent = `${len} chars · ${els.lang.value}`;
+  }
+}
+
+function setInputMode(mode) {
+  inputMode = mode;
+  const isPr = mode === "pr";
+
+  // 切换按钮状态
+  els.modeBtns.forEach((btn) => {
+    const active = btn.dataset.mode === mode;
+    btn.classList.toggle("mode-active", active);
+    btn.setAttribute("aria-selected", String(active));
+  });
+
+  // 切换输入框
+  els.code.hidden = isPr;
+  els.prUrl.hidden = !isPr;
+
+  // 切换 lang select 和 sample 按钮
+  els.lang.hidden = isPr;
+  els.btnSample.hidden = isPr;
+
+  // 清空内容
+  if (isPr) {
+    els.code.value = "";
+  } else {
+    els.prUrl.value = "";
+  }
+
+  updateMeta();
+
+  // 聚焦到输入框
+  if (isPr) {
+    els.prUrl.focus();
+  } else {
+    els.code.focus();
+  }
 }
 
 function setRunning(running) {
@@ -1468,16 +1576,33 @@ function setProgressTime(elapsedSec) {
    调用 /api/v1/reviews/stream(SSE 流式审查)
    ════════════════════════════════════════════════════════════ */
 async function submitReviewStream() {
-  const code = els.code.value;
-  const language = els.lang.value;
+  let apiUrl, body;
 
-  if (!code.trim()) {
-    showError("代码不能为空");
-    return;
-  }
-  if (code.length > 50000) {
-    showError(`代码长度 ${code.length} 超过 50000 字符上限`);
-    return;
+  if (inputMode === "pr") {
+    const prUrl = els.prUrl.value.trim();
+    if (!prUrl) {
+      showError("请输入 GitHub PR URL");
+      return;
+    }
+    if (!/^https?:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(prUrl)) {
+      showError("无效的 GitHub PR URL 格式");
+      return;
+    }
+    apiUrl = "/api/v1/reviews/stream/from-pr";
+    body = JSON.stringify({ pr_url: prUrl });
+  } else {
+    const code = els.code.value;
+    const language = els.lang.value;
+    if (!code.trim()) {
+      showError("代码不能为空");
+      return;
+    }
+    if (code.length > 50000) {
+      showError(`代码长度 ${code.length} 超过 50000 字符上限`);
+      return;
+    }
+    apiUrl = "/api/v1/reviews/stream";
+    body = JSON.stringify({ code, language });
   }
 
   setRunning(true);
@@ -1495,10 +1620,10 @@ async function submitReviewStream() {
   let retried = false;
 
   async function fetchAndStream() {
-    const res = await fetch("/api/v1/reviews/stream", {
+    const res = await fetch(apiUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, language }),
+      body: body,
     });
 
     if (!res.ok) {
@@ -1750,6 +1875,14 @@ async function lookupById() {
    ════════════════════════════════════════════════════════════ */
 els.btnReview.addEventListener("click", submitReviewStream);
 
+// 模式切换
+els.modeBtns.forEach((btn) => {
+  btn.addEventListener("click", () => {
+    if (isRunning) return;
+    setInputMode(btn.dataset.mode);
+  });
+});
+
 els.btnSample.addEventListener("click", () => {
   els.code.value = SAMPLE_PY;
   els.lang.value = "python";
@@ -1757,9 +1890,14 @@ els.btnSample.addEventListener("click", () => {
 });
 
 els.btnClear.addEventListener("click", () => {
-  els.code.value = "";
-  updateMeta();
-  els.code.focus();
+  if (inputMode === "pr") {
+    els.prUrl.value = "";
+    els.prUrl.focus();
+  } else {
+    els.code.value = "";
+    updateMeta();
+    els.code.focus();
+  }
 });
 
 els.btnCopyMd.addEventListener("click", async () => {
@@ -1801,6 +1939,7 @@ function switchTab(tab) {
   els.evalView.hidden = !isEval;
   els.btnCopyMd.hidden = isEval;
   els.btnEvalRefresh.hidden = !isEval;
+  els.evalModeSelect.hidden = !isEval;
   if (isEval && !evalDataCache && !evalLoading) {
     loadEvaluation(false);
   }
@@ -1822,16 +1961,25 @@ els.tabEval.addEventListener("click", () => switchTab("eval"));
 });
 
 els.btnEvalRefresh.addEventListener("click", () => loadEvaluation(true));
+els.evalModeSelect.addEventListener("change", (e) => {
+  evalMode = e.target.value;
+  evalDataCache = null; // 切换模式时清缓存
+  loadEvaluation(false);
+});
 
 async function loadEvaluation(force) {
   if (evalLoading) return;
   evalLoading = true;
   els.btnEvalRefresh.disabled = true;
+  els.evalModeSelect.disabled = true;
+  const isLLM = evalMode === "llm";
   els.btnEvalRefresh.innerHTML = '<span class="eval-loading"></span>评测中...';
-  els.evalView.innerHTML = '<div class="eval-empty"><div class="icon">📊</div><div>正在加载评测数据...</div></div>';
+  els.evalView.innerHTML = `<div class="eval-empty"><div class="icon">📊</div><div>${isLLM ? "LLM Judge 评测中，预计需要 30-40 分钟..." : "正在加载评测数据..."}</div></div>`;
 
   try {
-    const url = force ? "/api/v1/evaluation/summary?force=1" : "/api/v1/evaluation/summary";
+    const params = new URLSearchParams({ mode: evalMode });
+    if (force) params.set("force", "1");
+    const url = `/api/v1/evaluation/summary?${params}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -1852,6 +2000,7 @@ async function loadEvaluation(force) {
     evalLoading = false;
     els.btnEvalRefresh.disabled = false;
     els.btnEvalRefresh.textContent = "重新评测";
+    els.evalModeSelect.disabled = false;
   }
 }
 
@@ -1859,6 +2008,18 @@ function renderEvaluation(data) {
   const prf = data.prf_avg || { precision: 0, recall: 0, f1: 0 };
   const composite = (data.composite_avg ?? 0).toFixed(3);
   const f1 = (prf.f1 ?? 0).toFixed(3);
+  const modeLabel = data.mode === "llm" ? "LLM Judge" : "规则基线";
+
+  // 同步 select 值
+  if (els.evalModeSelect) els.evalModeSelect.value = data.mode || "rule_based";
+
+  // LLM 模式下显示 Token 用量卡片
+  const tokenCard = data.mode === "llm" && data.tokens ? `
+      <div class="eval-card">
+        <div class="eval-card-label">Token 用量</div>
+        <div class="eval-card-value" style="font-size:14px;">${(data.tokens.total_tokens ?? 0).toLocaleString()}</div>
+        <div class="eval-card-sub">${data.tokens.call_count ?? 0} calls</div>
+      </div>` : "";
 
   const html = `
     <div class="eval-overview">
@@ -1878,16 +2039,31 @@ function renderEvaluation(data) {
         <div class="eval-card-sub">samples</div>
       </div>
       <div class="eval-card">
-        <div class="eval-card-label">缓存</div>
-        <div class="eval-card-value">${data.from_cache ? "命中" : "miss"}</div>
-        <div class="eval-card-sub">${data.from_cache ? "from cache" : "fresh computed"}</div>
+        <div class="eval-card-label">评测模式</div>
+        <div class="eval-card-value" style="font-size:16px;">${modeLabel}</div>
+        <div class="eval-card-sub">${data.from_cache ? "缓存命中" : "实时计算"}</div>
       </div>
+      ${tokenCard}
     </div>
 
     <div class="eval-chart-wrap">
       <div class="eval-chart-title">分类得分对比</div>
       <div class="eval-chart-canvas-wrap">
         <canvas id="eval-chart"></canvas>
+      </div>
+    </div>
+
+    <div class="eval-chart-wrap" id="eval-scan-wrap">
+      <div class="eval-chart-title">置信度阈值分析（Task 13.4）</div>
+      <div id="eval-scan-status" style="color:var(--text-muted);font-size:12px;margin-bottom:8px;">加载中...</div>
+      <div class="eval-chart-canvas-wrap">
+        <canvas id="eval-scan-chart"></canvas>
+      </div>
+      <div id="eval-scan-controls" style="margin-top:12px;display:none;">
+        <label for="eval-threshold-slider" style="font-size:12px;color:var(--text-muted);">阈值: <span id="eval-threshold-value">0.0</span></label>
+        <input type="range" id="eval-threshold-slider" min="0" max="9" step="1" value="0" style="width:100%;margin:8px 0;" aria-label="置信度阈值">
+        <div id="eval-threshold-metrics" style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px;"></div>
+        <div id="eval-threshold-advice" style="margin-top:8px;font-size:12px;color:var(--text-muted);"></div>
       </div>
     </div>
 
@@ -1899,6 +2075,7 @@ function renderEvaluation(data) {
 
   renderEvalChart(data.by_category || {});
   bindSampleEvents();
+  loadScanThreshold();
 }
 
 function renderSampleGroups(samples) {
@@ -2005,6 +2182,124 @@ function renderEvalChart(byCategory) {
   });
 }
 
+/* ── Task 13.4: 置信度阈值分析 ── */
+let scanChartInstance = null;
+let scanDataCache = null;  // { table, current_threshold, best_f1_threshold }
+
+async function loadScanThreshold() {
+  const statusEl = $("eval-scan-status");
+  const controlsEl = $("eval-scan-controls");
+  if (!statusEl) return;
+
+  try {
+    const res = await fetch("/api/v1/evaluation/scan-threshold");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    scanDataCache = await res.json();
+    statusEl.textContent = `当前阈值: ${scanDataCache.current_threshold.toFixed(1)} | F1 最优阈值: ${scanDataCache.best_f1_threshold.toFixed(1)}`;
+    statusEl.style.color = "var(--text-muted)";
+    controlsEl.style.display = "block";
+    renderScanChart(scanDataCache.table);
+    // 滑块初始值设为 best_f1_threshold * 10（取整）
+    const slider = $("eval-threshold-slider");
+    if (slider) {
+      slider.value = Math.round(scanDataCache.best_f1_threshold * 10);
+      updateThresholdMetrics();
+      slider.addEventListener("input", updateThresholdMetrics);
+    }
+  } catch (err) {
+    statusEl.textContent = `加载失败: ${err.message}`;
+    statusEl.style.color = "#ef4444";
+  }
+}
+
+function renderScanChart(table) {
+  const canvas = $("eval-scan-chart");
+  if (!canvas) return;
+  if (window.__chartJsFailed || typeof Chart === "undefined") {
+    canvas.parentElement.innerHTML = '<div style="color:var(--text-muted);font-size:12px;text-align:center;padding:20px;">Chart.js 加载失败</div>';
+    return;
+  }
+  if (scanChartInstance) scanChartInstance.destroy();
+
+  const labels = table.map(r => r.threshold.toFixed(1));
+  const precisionData = table.map(r => r.precision);
+  const recallData = table.map(r => r.recall);
+  const f1Data = table.map(r => r.f1);
+
+  const isDark = document.documentElement.getAttribute("data-theme") !== "light";
+  const textColor = isDark ? "#9ca3af" : "#6b7280";
+  const gridColor = isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)";
+
+  scanChartInstance = new Chart(canvas, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        { label: "Precision", data: precisionData, borderColor: "#3b82f6", backgroundColor: "rgba(59,130,246,0.2)", tension: 0.3, pointRadius: 4 },
+        { label: "Recall", data: recallData, borderColor: "#f59e0b", backgroundColor: "rgba(245,158,11,0.2)", tension: 0.3, pointRadius: 4 },
+        { label: "F1", data: f1Data, borderColor: "#10b981", backgroundColor: "rgba(16,185,129,0.2)", tension: 0.3, pointRadius: 4, borderWidth: 2 },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        y: { beginAtZero: true, max: 1, ticks: { color: textColor, font: { size: 11 } }, grid: { color: gridColor } },
+        x: { ticks: { color: textColor, font: { size: 11 } }, grid: { display: false }, title: { display: true, text: "置信度阈值", color: textColor, font: { size: 11 } } },
+      },
+      plugins: {
+        legend: { labels: { color: textColor, font: { size: 11 } } },
+        tooltip: { mode: "index", intersect: false },
+      },
+    },
+  });
+}
+
+function updateThresholdMetrics() {
+  if (!scanDataCache) return;
+  const slider = $("eval-threshold-slider");
+  const valueEl = $("eval-threshold-value");
+  const metricsEl = $("eval-threshold-metrics");
+  const adviceEl = $("eval-threshold-advice");
+  if (!slider || !valueEl || !metricsEl) return;
+
+  const idx = parseInt(slider.value, 10);
+  const threshold = idx / 10;
+  valueEl.textContent = threshold.toFixed(1);
+
+  const row = scanDataCache.table[idx];
+  if (!row) return;
+
+  metricsEl.innerHTML = `
+    <div style="padding:6px 10px;background:var(--bg-elevated);border-radius:6px;">
+      <span style="color:var(--text-muted);">Precision</span>
+      <div style="font-weight:600;color:#3b82f6;font-size:14px;">${row.precision.toFixed(4)}</div>
+    </div>
+    <div style="padding:6px 10px;background:var(--bg-elevated);border-radius:6px;">
+      <span style="color:var(--text-muted);">Recall</span>
+      <div style="font-weight:600;color:#f59e0b;font-size:14px;">${row.recall.toFixed(4)}</div>
+    </div>
+    <div style="padding:6px 10px;background:var(--bg-elevated);border-radius:6px;">
+      <span style="color:var(--text-muted);">F1</span>
+      <div style="font-weight:600;color:#10b981;font-size:14px;">${row.f1.toFixed(4)}</div>
+    </div>
+  `;
+
+  // 建议文案
+  const bestIdx = Math.round(scanDataCache.best_f1_threshold * 10);
+  let advice = "";
+  if (idx === bestIdx) {
+    advice = "★ 当前为 F1 最优阈值";
+  } else if (row.f1 > scanDataCache.table[bestIdx].f1 * 0.95) {
+    advice = `接近最优（F1 差距 < 5%），可考虑。最优阈值: ${scanDataCache.best_f1_threshold.toFixed(1)}`;
+  } else if (threshold < scanDataCache.best_f1_threshold) {
+    advice = `阈值偏低，precision 较低（更多误报）。建议提高至 ${scanDataCache.best_f1_threshold.toFixed(1)}`;
+  } else {
+    advice = `阈值偏高，recall 较低（漏报增多）。建议降低至 ${scanDataCache.best_f1_threshold.toFixed(1)}`;
+  }
+  adviceEl.textContent = advice;
+}
+
 els.btnTheme.addEventListener("click", toggleTheme);
 els.btnToggleSidebar.addEventListener("click", toggleSidebar);
 
@@ -2028,6 +2323,12 @@ els.lang.addEventListener("change", updateMeta);
 
 // Ctrl/Cmd + Enter 快捷提交
 els.code.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    e.preventDefault();
+    submitReviewStream();
+  }
+});
+els.prUrl.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
     e.preventDefault();
     submitReviewStream();

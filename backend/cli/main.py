@@ -1,6 +1,6 @@
 """CLI 入口（Task 6.2 + Phase 9 Task 9.2）。
 
-python -m backend.cli review --file samples/sample_bad_python.py
+python -m backend.cli review --file backend/tests/samples/sample_bad_python.py
 python -m backend.cli review --pr https://github.com/owner/repo/pull/1
 
 stdout 输出完整 Markdown 报告，面试演示入口。

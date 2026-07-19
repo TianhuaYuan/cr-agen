@@ -7,26 +7,29 @@ render_report：渲染 Markdown 评测报告。
 
 CLI：
   python -m backend.services.evaluation.eval --limit 5
-  python scripts/eval.py --all --report eval_report.md
+  python -m backend.services.evaluation.eval --all --report reports/eval_report.md
 """
 import argparse
 import asyncio
 import json
 from pathlib import Path
 from statistics import mean
+from types import SimpleNamespace
 
-from backend.services.aggregator.merge import aggregate_findings
+from backend.services.aggregator.merge import aggregate_findings, split_by_confidence
 from backend.services.evaluation.dataset import Sample, load_dataset
 from backend.services.evaluation.judge import judge_with_llm
 from backend.services.evaluation.metrics import compute_prf
 from backend.services.supervisor.graph import build_supervisor_graph
 
 
-async def run_one(sample: Sample, judge_client=None, meter=None) -> dict:
+async def run_one(sample: Sample, judge_client=None, meter=None,
+                  confidence_threshold: float = 0.0) -> dict:
     """单条样本评测：graph 审查 → judge 评分。
 
     返回 dict 含：id / category / language / judgment / findings（graph 原始 findings）。
     meter 为可选 TokenMeter（W3 Task 11.3 接入），传入则用 MeteredClient 包 graph client。
+    confidence_threshold > 0 时，先过滤低置信度 finding 再算 PRF（Task 13.3）。
     """
     graph_client = None
     original_getter = None
@@ -50,7 +53,9 @@ async def run_one(sample: Sample, judge_client=None, meter=None) -> dict:
 
     report = result.get("report", "")
     # 用聚合后的去重 findings 作为「实际发现」（与报告一致），PRF 比对更准
-    findings = aggregate_findings(result.get("worker_results", []))
+    all_findings = aggregate_findings(result.get("worker_results", []))
+    # Task 13.3: 置信度阈值过滤（split_by_confidence 内部已处理 threshold<=0 → 不过滤）
+    findings, _low = split_by_confidence(all_findings, confidence_threshold)
     expected = [f.__dict__ for f in sample.expected_findings]
     prf = compute_prf(expected, findings)
     judgment = await judge_with_llm(sample.code, expected, report, client=judge_client)
@@ -62,6 +67,8 @@ async def run_one(sample: Sample, judge_client=None, meter=None) -> dict:
         "findings": findings,
         "prf": prf,
         "report": report,
+        "_expected": expected,  # Task 13.3: scan_threshold 需要，重新算 PRF
+        "_all_findings": all_findings,  # 未过滤的完整 findings，scan_threshold 用
     }
 
 
@@ -85,6 +92,46 @@ async def run_all(dataset_path: str | Path, limit: int | None = None, meter=None
     summary = summarize(results)
     summary["tokens"] = meter.to_dict() if meter is not None else None
     return summary
+
+
+def scan_threshold(results: list[dict]) -> list[dict]:
+    """对已有 results 扫不同 confidence 阈值，返回各阈值 P/R/F1 表格。
+
+    不重跑 graph——复用 results 里的 _all_findings（带 confidence，未过滤），
+    用不同阈值过滤后，配合 _expected 重新算真实 PRF。
+    O(阈值数 × findings 数)，非常快。
+
+    Args:
+        results: run_one / run_samples 的返回列表，需含 _all_findings + _expected
+
+    Returns:
+        [{"threshold": 0.0, "precision": ..., "recall": ..., "f1": ...}, ...]
+        10 行，threshold 从 0.0 到 0.9 步长 0.1
+    """
+    if not results:
+        return []
+
+    # 只取有 _all_findings + _expected 的结果
+    valid = [r for r in results if "_all_findings" in r and "_expected" in r]
+    if not valid:
+        return []
+
+    table: list[dict] = []
+    for i in range(10):
+        threshold = i / 10.0
+        prf_list = []
+        for r in valid:
+            high, _low = split_by_confidence(r["_all_findings"], threshold)
+            prf = compute_prf(r["_expected"], high)
+            prf_list.append(prf)
+
+        table.append({
+            "threshold": threshold,
+            "precision": round(mean(p["precision"] for p in prf_list), 4),
+            "recall": round(mean(p["recall"] for p in prf_list), 4),
+            "f1": round(mean(p["f1"] for p in prf_list), 4),
+        })
+    return table
 
 
 def summarize(results: list[dict]) -> dict:
@@ -194,9 +241,11 @@ def main():
     )
     parser.add_argument("--dataset", default=str(default_dataset))
     parser.add_argument("--limit", type=int, default=None, help="只评测前 N 条")
-    parser.add_argument("--out", default="eval_report.json", help="JSON 输出路径")
+    parser.add_argument("--out", default="reports/eval_report.json", help="JSON 输出路径")
     parser.add_argument("--report", default=None, help="Markdown 报告输出路径")
     parser.add_argument("--tokens", action="store_true", help="计量 token 用量（graph + judge 全量）")
+    parser.add_argument("--scan-threshold", action="store_true",
+                        help="扫描 0.0~0.9 置信度阈值，输出各阈值 P/R/F1 表格")
     args = parser.parse_args()
 
     meter = None
@@ -204,6 +253,46 @@ def main():
         from backend.services.evaluation.cost import TokenMeter
 
         meter = TokenMeter()
+
+    if args.scan_threshold:
+        # 阈值扫描模式：跑一次 graph，扫 10 个阈值，不跑真 judge（省 token）
+        # 用 _RuleJudgeClient 返回固定评分，仅为走通 run_one 流程拿到 findings
+
+        class _RuleJudgeClient:
+            """阈值扫描用的假 judge client：不调 LLM，返回固定评分。"""
+            @property
+            def chat(self):
+                async def _create(*a, **k):
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(message=SimpleNamespace(
+                            content=json.dumps({
+                                "completeness": 0.5, "accuracy": 0.5,
+                                "source_traceability": 0.5, "rationale": "scan",
+                            })
+                        ))]
+                    )
+                return SimpleNamespace(completions=SimpleNamespace(create=_create))
+
+        samples = load_dataset(args.dataset)
+        if args.limit:
+            samples = samples[:args.limit]
+        results = asyncio.run(run_samples(
+            samples, judge_client=_RuleJudgeClient(), meter=meter
+        ))
+        table = scan_threshold(results)
+        print("\n=== 置信度阈值扫描 ===")
+        print(f"{'阈值':>6} | {'precision':>10} | {'recall':>10} | {'f1':>10}")
+        print("-" * 48)
+        for row in table:
+            print(f"{row['threshold']:>6.1f} | {row['precision']:>10.4f} | "
+                  f"{row['recall']:>10.4f} | {row['f1']:>10.4f}")
+        # 找 F1 最优
+        best = max(table, key=lambda x: x["f1"])
+        print(f"\n★ F1 最优阈值：{best['threshold']:.1f} "
+              f"(P={best['precision']:.4f} / R={best['recall']:.4f} / F1={best['f1']:.4f})")
+        print(f"\n建议写入 settings.DEFAULT_CONFIDENCE_THRESHOLD = {best['threshold']:.1f}")
+        return
+
     summary = asyncio.run(run_all(args.dataset, args.limit, meter=meter))
     Path(args.out).write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"

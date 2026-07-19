@@ -5,6 +5,7 @@
 """
 import logging
 
+import httpx
 from openai import AsyncOpenAI
 
 from .config import settings
@@ -17,13 +18,20 @@ _chat_client: AsyncOpenAI | None = None
 
 
 def get_chat_client() -> AsyncOpenAI:
-    """返回（惰性创建）Chat 客户端单例。"""
+    """返回（惰性创建）Chat 客户端单例。
+
+    注意：显式传入 ``http_client=httpx.AsyncClient(trust_env=False)`` 禁用
+    环境变量代理（HTTP_PROXY/HTTPS_PROXY）。原因：开发机常驻系统代理（如
+    Clash/V2Ray）可能未运行或拒绝转发到 LLM API 域名，导致 ``Connection error``。
+    直连更稳定，LLM API 本身走 HTTPS 已经安全。
+    """
     global _chat_client
     if _chat_client is None:
         _chat_client = AsyncOpenAI(
             api_key=settings.CHAT_API_KEY,
             base_url=settings.CHAT_BASE_URL,
             timeout=settings.LLM_TIMEOUT,
+            http_client=httpx.AsyncClient(trust_env=False),
         )
     return _chat_client
 

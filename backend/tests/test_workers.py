@@ -204,19 +204,274 @@ class TestReviewFlow:
         assert "异常" not in findings[0]["description"]
 
 
+# ── confidence 字段（Task 13.1）─────────────────────────────
+
+class TestConfidenceField:
+    """Worker 输出必须支持 confidence 字段（0-1），缺失/越界做兜底。"""
+
+    def test_parse_response_with_confidence(self):
+        """LLM 返回带 confidence 的 JSON → 原样保留。"""
+        worker = QualityWorker()
+        text = json.dumps([
+            {"severity": "high", "line": 1, "description": "d",
+             "suggestion": "s", "code_snippet": "x", "confidence": 0.9}
+        ])
+        findings = worker._parse_response(text)
+        assert len(findings) == 1
+        assert findings[0]["confidence"] == 0.9
+
+    def test_parse_response_missing_confidence_defaults_to_0_5(self):
+        """LLM 返回不带 confidence → 兜底默认 0.5（中等置信度，不偏不倚）。"""
+        worker = SecurityWorker()
+        text = json.dumps([
+            {"severity": "high", "line": 1, "description": "d",
+             "suggestion": "s", "code_snippet": "x"}
+        ])
+        findings = worker._parse_response(text)
+        assert len(findings) == 1
+        assert findings[0]["confidence"] == 0.5
+
+    def test_parse_response_confidence_clamped_to_1(self):
+        """confidence > 1 → clamp 到 1.0。"""
+        worker = PerformanceWorker()
+        text = json.dumps([
+            {"severity": "high", "line": 1, "description": "d",
+             "suggestion": "s", "code_snippet": "x", "confidence": 1.5}
+        ])
+        findings = worker._parse_response(text)
+        assert findings[0]["confidence"] == 1.0
+
+    def test_parse_response_confidence_clamped_to_0(self):
+        """confidence < 0 → clamp 到 0.0。"""
+        worker = StructureWorker()
+        text = json.dumps([
+            {"severity": "high", "line": 1, "description": "d",
+             "suggestion": "s", "code_snippet": "x", "confidence": -0.3}
+        ])
+        findings = worker._parse_response(text)
+        assert findings[0]["confidence"] == 0.0
+
+    def test_parse_response_confidence_non_numeric_defaults_to_0_5(self):
+        """confidence 是字符串/None → 兜底 0.5。"""
+        worker = QualityWorker()
+        text = json.dumps([
+            {"severity": "high", "line": 1, "description": "d",
+             "suggestion": "s", "code_snippet": "x", "confidence": "high"}
+        ])
+        findings = worker._parse_response(text)
+        assert findings[0]["confidence"] == 0.5
+
+    def test_degraded_finding_has_confidence_0(self):
+        """降级 finding（超时/异常/解析失败）confidence = 0.0（最不可信）。"""
+        worker = QualityWorker()
+        # 坏 JSON → 降级 finding
+        findings = worker._parse_response("not json at all")
+        assert len(findings) == 1
+        assert findings[0]["confidence"] == 0.0
+
+    def test_system_prompt_mentions_confidence(self):
+        """4 个 Worker 的 system_prompt 必须提到 confidence 字段要求。"""
+        for cls in [QualityWorker, SecurityWorker, PerformanceWorker, StructureWorker]:
+            w = cls()
+            assert "confidence" in w.system_prompt.lower(), (
+                f"{cls.__name__} 的 system_prompt 必须提及 confidence 字段"
+            )
+
+    def test_output_format_constant_mentions_confidence(self):
+        """_OUTPUT_FORMAT 常量必须含 confidence 字段示例。"""
+        from backend.services.workers.base import _OUTPUT_FORMAT
+        assert "confidence" in _OUTPUT_FORMAT.lower()
+
+
 # ── helpers ─────────────────────────────────────────────────
 
-def _make_fake_client(response_text: str):
-    """构造假 LLM 客户端，对齐 openai SDK 的 resp.choices[0].message.content。"""
+def _make_fake_client(response_text: str, total_tokens: int | None = None):
+    """构造假 LLM 客户端，对齐 openai SDK 的 resp.choices[0].message.content。
+
+    可选 total_tokens：如果传了，resp.usage.total_tokens = 该值（用于测试 tracing 记录 tokens）。
+    """
     from types import SimpleNamespace
 
     class _Fake:
         @property
         def chat(self):
             async def _create(*args, **kwargs):
+                usage = None
+                if total_tokens is not None:
+                    usage = SimpleNamespace(total_tokens=total_tokens)
                 return SimpleNamespace(
-                    choices=[SimpleNamespace(message=SimpleNamespace(content=response_text))]
+                    choices=[SimpleNamespace(message=SimpleNamespace(content=response_text))],
+                    usage=usage,
                 )
             return SimpleNamespace(completions=SimpleNamespace(create=_create))
 
     return _Fake()
+
+
+# ── LLM 调用 tracing（Task 14.2）─────────────────────────────
+
+class _RecordingSpan:
+    """记录 start_span/update/end 调用的假 Span，用于验证 tracing 接入正确。"""
+
+    def __init__(self, name, metadata=None):
+        self.name = name
+        self.metadata = dict(metadata) if metadata else {}
+        self.update_calls: list[dict] = []
+        self.ended = False
+
+    def update(self, metadata=None):
+        if metadata:
+            self.metadata.update(metadata)
+            self.update_calls.append(dict(metadata))
+
+    def end(self, metadata=None):
+        if metadata:
+            self.metadata.update(metadata)
+            self.update_calls.append(dict(metadata))
+        self.ended = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.end()
+
+
+class _RecordingTracer:
+    """假 Tracer：记录所有 start_span 调用，返回 _RecordingSpan。"""
+
+    def __init__(self):
+        self.spans: list[_RecordingSpan] = []
+
+    def start_span(self, name, metadata=None):
+        span = _RecordingSpan(name, metadata=metadata)
+        self.spans.append(span)
+        return span
+
+
+class TestWorkerLLMTracing:
+    """Task 14.2: _call_llm 必须用 tracer.start_span 包裹，记录关键 metadata。
+
+    验证点：span 创建 / name / metadata 含 role+model / update 含 completion_length
+    / update 含 latency_ms / span 自动 end / resp.usage 存在时记录 tokens。
+    """
+
+    async def test_call_llm_creates_span(self, monkeypatch):
+        """_call_llm 调用后，tracer 应创建至少 1 个 span。"""
+        tracer = _RecordingTracer()
+        monkeypatch.setattr("backend.core.tracing.get_tracer", lambda: tracer)
+        client = _make_fake_client(_FINDINGS_JSON)
+        monkeypatch.setattr("backend.core.llm.get_chat_client", lambda: client)
+
+        worker = QualityWorker()
+        await worker._call_llm("some prompt")
+
+        assert len(tracer.spans) >= 1
+
+    async def test_call_llm_span_name_is_llm_call(self, monkeypatch):
+        """span.name 必须是 'llm_call'（约定名，便于在 Langfuse UI 过滤）。"""
+        tracer = _RecordingTracer()
+        monkeypatch.setattr("backend.core.tracing.get_tracer", lambda: tracer)
+        client = _make_fake_client(_FINDINGS_JSON)
+        monkeypatch.setattr("backend.core.llm.get_chat_client", lambda: client)
+
+        worker = QualityWorker()
+        await worker._call_llm("prompt")
+
+        assert tracer.spans[0].name == "llm_call"
+
+    async def test_call_llm_span_metadata_contains_role_and_model(self, monkeypatch):
+        """span 初始 metadata 必须含 role（worker 角色）和 model（CHAT_MODEL）。"""
+        tracer = _RecordingTracer()
+        monkeypatch.setattr("backend.core.tracing.get_tracer", lambda: tracer)
+        client = _make_fake_client(_FINDINGS_JSON)
+        monkeypatch.setattr("backend.core.llm.get_chat_client", lambda: client)
+
+        worker = SecurityWorker()
+        await worker._call_llm("prompt")
+
+        meta = tracer.spans[0].metadata
+        assert meta.get("role") == "security"
+        assert meta.get("model")  # 非空即对（具体值由 config 决定）
+
+    async def test_call_llm_span_metadata_contains_prompt_length(self, monkeypatch):
+        """span 初始 metadata 含 prompt_length（int，便于排查 prompt 过长问题）。"""
+        tracer = _RecordingTracer()
+        monkeypatch.setattr("backend.core.tracing.get_tracer", lambda: tracer)
+        client = _make_fake_client(_FINDINGS_JSON)
+        monkeypatch.setattr("backend.core.llm.get_chat_client", lambda: client)
+
+        worker = QualityWorker()
+        prompt = "x" * 200
+        await worker._call_llm(prompt)
+
+        meta = tracer.spans[0].metadata
+        assert meta.get("prompt_length") == 200
+
+    async def test_call_llm_span_updated_with_completion_length(self, monkeypatch):
+        """拿到 resp 后，span.update 必须被调用，包含 completion_length。"""
+        tracer = _RecordingTracer()
+        monkeypatch.setattr("backend.core.tracing.get_tracer", lambda: tracer)
+        client = _make_fake_client(_FINDINGS_JSON)
+        monkeypatch.setattr("backend.core.llm.get_chat_client", lambda: client)
+
+        worker = QualityWorker()
+        await worker._call_llm("prompt")
+
+        # metadata 里应有 completion_length（在 update 时加上）
+        all_meta = tracer.spans[0].metadata
+        assert "completion_length" in all_meta
+        assert all_meta["completion_length"] == len(_FINDINGS_JSON)
+
+    async def test_call_llm_span_updated_with_latency_ms(self, monkeypatch):
+        """span.update 必须包含 latency_ms（数值，单位毫秒）。"""
+        tracer = _RecordingTracer()
+        monkeypatch.setattr("backend.core.tracing.get_tracer", lambda: tracer)
+        client = _make_fake_client(_FINDINGS_JSON)
+        monkeypatch.setattr("backend.core.llm.get_chat_client", lambda: client)
+
+        worker = QualityWorker()
+        await worker._call_llm("prompt")
+
+        all_meta = tracer.spans[0].metadata
+        assert "latency_ms" in all_meta
+        assert isinstance(all_meta["latency_ms"], (int, float))
+        assert all_meta["latency_ms"] >= 0
+
+    async def test_call_llm_span_ended_automatically(self, monkeypatch):
+        """with 退出后，span 必须自动 end（_ended=True）。"""
+        tracer = _RecordingTracer()
+        monkeypatch.setattr("backend.core.tracing.get_tracer", lambda: tracer)
+        client = _make_fake_client(_FINDINGS_JSON)
+        monkeypatch.setattr("backend.core.llm.get_chat_client", lambda: client)
+
+        worker = QualityWorker()
+        await worker._call_llm("prompt")
+
+        assert tracer.spans[0].ended is True
+
+    async def test_call_llm_records_tokens_when_usage_present(self, monkeypatch):
+        """resp.usage 存在时，span.update 必须包含 tokens 字段。"""
+        tracer = _RecordingTracer()
+        monkeypatch.setattr("backend.core.tracing.get_tracer", lambda: tracer)
+        client = _make_fake_client(_FINDINGS_JSON, total_tokens=1234)
+        monkeypatch.setattr("backend.core.llm.get_chat_client", lambda: client)
+
+        worker = QualityWorker()
+        await worker._call_llm("prompt")
+
+        all_meta = tracer.spans[0].metadata
+        assert all_meta.get("tokens") == 1234
+
+    async def test_call_llm_no_tokens_when_usage_absent(self, monkeypatch):
+        """resp.usage 为 None 时，span 不应该崩，tokens 字段可不设置或为 None。"""
+        tracer = _RecordingTracer()
+        monkeypatch.setattr("backend.core.tracing.get_tracer", lambda: tracer)
+        # 不传 total_tokens → resp.usage = None
+        client = _make_fake_client(_FINDINGS_JSON)
+        monkeypatch.setattr("backend.core.llm.get_chat_client", lambda: client)
+
+        worker = QualityWorker()
+        # 不抛异常即可
+        await worker._call_llm("prompt")
+        assert tracer.spans[0].ended is True

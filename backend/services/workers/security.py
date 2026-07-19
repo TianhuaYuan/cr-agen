@@ -15,5 +15,7 @@ class SecurityWorker(BaseWorker):
         "- 不安全的反序列化（pickle.loads, yaml.load 无 Loader）\n"
         "- 危险函数调用（eval, exec, os.system, subprocess shell=True）\n"
         "- 缺少输入校验 / 信任用户输入\n"
-        "- 敏感信息日志泄露"
+        "- 敏感信息日志泄露\n\n"
+        "对每条发现，请给出 confidence（0.0-1.0）表示你对该问题的置信度，"
+        "1.0=非常确定是问题，0.5=不确定，0.0=几乎不可能是问题。"
     )

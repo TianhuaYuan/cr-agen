@@ -33,8 +33,22 @@ class Settings(BaseSettings):
     # Worker 每次调用会把它作为 asyncio.wait_for 的权威超时传下去。
     LLM_TIMEOUT: float = 120.0
 
+    # ── 置信度阈值（Task 13.2）──
+    # Aggregator 层过滤 confidence < 阈值的 finding，移到低置信度区。
+    # 0.0 = 不过滤（保留所有 finding）；0.5 = 中等过滤；0.7 = 激进过滤。
+    # 默认 0.0：先跑通流程，Task 13.3 阈值扫描后写入最优值。
+    DEFAULT_CONFIDENCE_THRESHOLD: float = 0.0
+
+    # ── Langfuse 链路追踪（Phase 14）──
+    # 未配置时静默降级为 NoOp tracer（不报错，只是不追踪）。
+    # 配置方式：在 .env 写 LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST
+    # 并 pip install langfuse，重启服务即生效。
+    LANGFUSE_PUBLIC_KEY: str = ""
+    LANGFUSE_SECRET_KEY: str = ""
+    LANGFUSE_HOST: str = "http://localhost:3000"
+
     # ── 数据库（开发默认本地 SQLite async）──
-    DATABASE_URL: str = "sqlite+aiosqlite:///./cr_agent.db"
+    DATABASE_URL: str = "sqlite+aiosqlite:///./data/cr_agent.db"
 
     # ── 日志 ──
     LOG_LEVEL: str = "INFO"
@@ -43,6 +57,8 @@ class Settings(BaseSettings):
     # 生产环境应设为 True：未配置 GITHUB_WEBHOOK_SECRET 时拒绝请求（防空 secret 免鉴权）。
     # 开发环境默认 False，允许不配 secret 直接跑通（便利）。
     WEBHOOK_SECRET_REQUIRED: bool = False
+    GITHUB_WEBHOOK_SECRET: str = ""
+    GITHUB_TOKEN: str = ""
 
     # ── API / MCP 鉴权（JWT）──
     # 默认关闭（开发态免鉴权，便利）。生产部署必须设 API_AUTH_REQUIRED=True

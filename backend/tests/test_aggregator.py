@@ -86,6 +86,121 @@ class TestAggregate:
         assert severities == ["high", "high", "low"]
 
 
+# ── confidence 阈值过滤（Task 13.2）─────────────────────────
+
+class TestConfidenceThreshold:
+    """aggregate_findings 支持 confidence_threshold 参数 + split_by_confidence 辅助函数。"""
+
+    def test_default_threshold_zero_no_filtering(self):
+        """默认 threshold=0.0 → 不过滤任何 finding（向后兼容）。"""
+        findings = [
+            {"severity": "high", "line": 1, "description": "d1", "worker": "security",
+             "confidence": 0.1},
+            {"severity": "low", "line": 2, "description": "d2", "worker": "quality",
+             "confidence": 0.9},
+        ]
+        result = aggregate_findings(findings)
+        assert len(result) == 2  # 不过滤
+
+    def test_threshold_filters_low_confidence(self):
+        """threshold=0.5 → confidence < 0.5 的 finding 被过滤掉。"""
+        findings = [
+            {"severity": "high", "line": 1, "description": "d1", "worker": "security",
+             "confidence": 0.3},
+            {"severity": "low", "line": 2, "description": "d2", "worker": "quality",
+             "confidence": 0.8},
+        ]
+        result = aggregate_findings(findings, confidence_threshold=0.5)
+        assert len(result) == 1
+        assert result[0]["description"] == "d2"  # 只保留高置信度的
+
+    def test_threshold_boundary_inclusive(self):
+        """threshold=0.5 → confidence == 0.5 的 finding 被保留（>= 阈值，边界包含）。"""
+        findings = [
+            {"severity": "high", "line": 1, "description": "boundary", "worker": "security",
+             "confidence": 0.5},
+        ]
+        result = aggregate_findings(findings, confidence_threshold=0.5)
+        assert len(result) == 1  # == 阈值，保留
+
+    def test_missing_confidence_treated_as_zero(self):
+        """缺失 confidence 字段 → 视为 0.0（最不可信），threshold > 0 时被过滤。"""
+        findings = [
+            {"severity": "high", "line": 1, "description": "no_conf", "worker": "security"},
+            {"severity": "low", "line": 2, "description": "with_conf", "worker": "quality",
+             "confidence": 0.9},
+        ]
+        result = aggregate_findings(findings, confidence_threshold=0.5)
+        assert len(result) == 1
+        assert result[0]["description"] == "with_conf"
+
+    def test_split_by_confidence_returns_tuple(self):
+        """split_by_confidence 返回 (high, low) 两个列表。"""
+        from backend.services.aggregator.merge import split_by_confidence
+        findings = [
+            {"severity": "high", "line": 1, "description": "d1", "worker": "security",
+             "confidence": 0.3},
+            {"severity": "low", "line": 2, "description": "d2", "worker": "quality",
+             "confidence": 0.8},
+        ]
+        high, low = split_by_confidence(findings, threshold=0.5)
+        assert len(high) == 1
+        assert len(low) == 1
+        assert high[0]["description"] == "d2"
+        assert low[0]["description"] == "d1"
+
+    def test_split_by_confidence_preserves_input(self):
+        """split_by_confidence 不修改输入列表。"""
+        from backend.services.aggregator.merge import split_by_confidence
+        findings = [
+            {"severity": "high", "line": 1, "description": "d1", "worker": "security",
+             "confidence": 0.3},
+        ]
+        original = list(findings)
+        split_by_confidence(findings, threshold=0.5)
+        assert findings == original
+
+
+# ── generate_report 的 low_confidence 区（Task 13.2）─────────
+
+class TestReportLowConfidence:
+    """generate_report 支持 low_confidence 参数，报告分两区展示。"""
+
+    def test_report_without_low_confidence_unchanged(self):
+        """无 low_confidence 参数 → 报告行为不变（向后兼容）。"""
+        findings = [
+            {"severity": "high", "line": 1, "description": "d1", "suggestion": "s",
+             "code_snippet": "", "worker": "security", "confidence": 0.9},
+        ]
+        report = generate_report(findings, language="python", errors=[])
+        assert "低置信度" not in report  # 没有低置信度区
+
+    def test_report_with_low_confidence_section(self):
+        """有 low_confidence → 报告含「低置信度提示」区。"""
+        findings = [
+            {"severity": "high", "line": 1, "description": "d1", "suggestion": "s",
+             "code_snippet": "", "worker": "security", "confidence": 0.9},
+        ]
+        low = [
+            {"severity": "low", "line": 2, "description": "low_conf_issue",
+             "suggestion": "s", "code_snippet": "", "worker": "quality", "confidence": 0.3},
+        ]
+        report = generate_report(findings, language="python", errors=[],
+                                 low_confidence=low)
+        assert "低置信度" in report or "low confidence" in report.lower()
+        assert "low_conf_issue" in report
+
+    def test_report_low_confidence_section_empty_list_no_section(self):
+        """low_confidence=[] → 不显示低置信度区（与 None 等价）。"""
+        findings = [
+            {"severity": "high", "line": 1, "description": "d1", "suggestion": "s",
+             "code_snippet": "", "worker": "security", "confidence": 0.9},
+        ]
+        report = generate_report(findings, language="python", errors=[],
+                                 low_confidence=[])
+        assert "低置信度" not in report
+
+
 # ── generate_report ─────────────────────────────────────────
 
 class TestReport:

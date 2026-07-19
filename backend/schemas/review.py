@@ -15,6 +15,12 @@ class ReviewRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class PRReviewRequest(BaseModel):
+    pr_url: str = Field(..., min_length=10, max_length=500)
+
+    model_config = {"extra": "forbid"}
+
+
 class ReviewResponse(BaseModel):
     review_id: str
     status: str

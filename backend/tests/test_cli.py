@@ -146,9 +146,9 @@ def test_resolve_review_file_rejects_secret_files():
 
 
 def test_resolve_review_file_allows_sample():
-    """--file 指向项目内正常代码样本（samples/sample_bad_python.py）→ 返回绝对路径。"""
+    """--file 指向项目内正常代码样本（backend/tests/samples/sample_bad_python.py）→ 返回绝对路径。"""
     from backend.cli.main import _resolve_review_file
 
-    path = _resolve_review_file("samples/sample_bad_python.py")
+    path = _resolve_review_file("backend/tests/samples/sample_bad_python.py")
     assert path.is_absolute()
     assert path.name == "sample_bad_python.py"
