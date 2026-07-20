@@ -22,8 +22,7 @@ backend/tests/**/.pytest_cache
 .coverage
 htmlcov
 
-# 数据目录
-backend/data/
+# 数据目录（仅根目录 data/，backend/data/ 保留用于 LLM 预计算结果）
 data/
 
 # IDE
@@ -32,10 +31,6 @@ data/
 *.swp
 *.swo
 *~
-
-# 文档（但保留 docs/tasks/ 预计算评测结果，LLM 模式需要它）
-docs/
-!docs/tasks/
 
 # Node.js（如果有）
 node_modules
